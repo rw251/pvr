@@ -183,7 +183,7 @@ class HTSPMessage {
 					i = i -1;
 				}
 			}
-			else if (typ == HMF_LIST || type == HMF_MAP) {
+			else if (typ == HMF_LIST || typ == HMF_MAP) {
 				item = this.deserialize0(data.slice(0, dlen), typ);
 			}
 
@@ -204,19 +204,30 @@ class HTSPClient {
 	constructor(host, port, onConnect) {
 
 		this.sock = new net.Socket();
-		this.sock.setEncoding('binary');
+    this.sock.setEncoding('binary');
+    
+    this.videoSock = new net.Socket();
+    this.videoSock.setEncoding('binary');
 
 		var self = this;
 		this.sock.connect(port, host, function() {
 			onConnect(self);
-		});
+    });
+    
+    this.videoSock.connect(port, host, () => {
+      console.log('video sock up');
+    });
 
 		this.onData = function(x) {
       console.log('this.onData: ' + x);
 		};
 
+		this.onVideoData = function(x) {
+      console.log('this.onVideoData: ' + x);
+		};
+
 		this.sock.on('data', function(data) {
-		  //console.log(data);
+      //var msg = new HTSPMessage().deserialize0(data.slice(4));
 			self.onData(data);
 		});
 
@@ -231,11 +242,29 @@ class HTSPClient {
 
 		this.sock.on('end', function() {
 			console.log('sock end');
+    })
+    
+		this.videoSock.on('data', function(data) {
+      //var msg = new HTSPMessage().deserialize0(data.slice(4));
+			self.onVideoData(data);
+		});
+
+		this.videoSock.on('error', function(err) {
+			console.log('videoSock ERRROR!!!');
+			console.log(err);
+		});
+
+		this.videoSock.on('close', function(had_error) {
+			console.log('videoSock closed - error = '+had_error)
+		});
+
+		this.videoSock.on('end', function() {
+			console.log('videoSock end');
 		})
 
 	}
 
-	send(func, args, callback, debug) {
+	send(func, args, callback, isVideo, debug) {
 		if (!args) args = {};
 		args['method'] = func;
 
@@ -245,56 +274,95 @@ class HTSPClient {
 
 		var s = new HTSPMessage().serialize(args);
 
-		this.sock.write(s, 'binary', callback);
-	}
+    this[isVideo ? 'videoSock' : 'sock'].write(s, 'binary', callback);
+  } 
+  
+
+  short(func, args, callback, isVideo) {
+    args.htspversion = 27;
+    args.clientname = 'node-htsp';
+
+    this[isVideo ? 'onVideoData' : 'onData'] = function(data) {
+      data = data.slice(4);
+      var msg = new HTSPMessage().deserialize0(data);
+      callback(msg);
+    };
+  
+    this.send(func, args, null, isVideo);
+  }
+  
+  long(func, args, callback) {
+    args.htspversion = 27;
+    args.clientname = 'node-htsp';
+
+    let resp;
+    let tout;
+    this.onData = function(data) {
+      clearTimeout(tout);
+      if(!resp) resp = data.slice(4);
+      else resp += data;
+      const msg = new HTSPMessage().deserialize0(resp);
+      tout = setTimeout(() => {
+        callback(msg)
+      }, 500);
+    };
+  
+    this.send(func, args);
+  }
 
 	hello(callback) {
-		var args = {
-      		'htspversion' : 23,
-      		'clientname'  : 'node-htsp'
-    	}
+    this.short('hello', {}, callback);
+  }
 
-    	var self = this;
-    	this.onData = function(data) {
-    		self.recvHello(data, callback);
-    	};
-
-    	this.send('hello', args);
+	videoHello(callback) {
+    this.short('hello', {}, callback, true);
   }
   
   getDiskSpace(callback) {
-		var args = {}
-
-    var self = this;
-    this.onData = function(data) {
-      self.recvGetDiskSpace(data, callback);
-    };
-
-    this.send('getDiskSpace', args);
+    this.short('getDiskSpace', {}, (msg) => {
+      const {error, freediskspace = 0, totaldiskspace = 0} = new HTSPMessage().deserialize0(data);
+      callback({freediskspace ,totaldiskspace});
+    });
   }
 
-
-	recvGetDiskSpace(data, callback) {
-		//The data comes back with 3 NULL chars and an odd symbol no idea why, need to remove them for this to work
-		//It seems to be a byte order mark but doesn't match utf-8, utf-16 etc.
-		//Is this added by the buffer? By the socket? Sent by the server? Could do with a proper explanation,
-		//but for now just remove the BOM and continue 
-		data = data.slice(4);
-		var msg = new HTSPMessage().deserialize0(data);
-    callback(msg);
-//
+  /**
+   * @returns {Object} time - UNIX time / gmtoffset - minutes east of gmt
+   */
+  getSystemTime(callback) {
+    this.short('getSysTime', {}, (msg) => {
+      const {error, time, gmtoffset} = new HTSPMessage().deserialize0(data);
+      callback({time, gmtoffset});
+    });
   }
 
+  /**
+   * @returns {Object} time - UNIX time / gmtoffset - minutes east of gmt
+   */
+  getEvents(callback) {
+    this.long('getEvents', {}, callback);
+  }  
+  /**
+   * @returns {Object} time - UNIX time / gmtoffset - minutes east of gmt
+   */
+  getChannel(channelId, callback) {
+    this.short('getChannel' , { channelId }, callback);
+  }
 
-	recvHello(data, callback) {
-		//The data comes back with 3 NULL chars and an odd symbol no idea why, need to remove them for this to work
-		//It seems to be a byte order mark but doesn't match utf-8, utf-16 etc.
-		//Is this added by the buffer? By the socket? Sent by the server? Could do with a proper explanation,
-		//but for now just remove the BOM and continue 
-		data = data.slice(4);
-		var msg = new HTSPMessage().deserialize0(data);
-    callback(msg);
-//
+  getEpgObject(id, callback) {
+    this.long('getEpgObject', { id }, callback);
+  }
+
+  epgQuery(query, callback) {
+    this.long('epgQuery', { query, full: 1 }, callback);
+  }
+
+  getDvrConfigs(callback) {
+    this.short('getDvrConfigs', {}, callback);
+  }
+
+  subscribe(channelId, callback) {
+    this.subId = Math.random();
+    this.long('subscribe', { channelId, subscriptionId: this.subId }, callback);
   }
   
   end() {
@@ -303,11 +371,13 @@ class HTSPClient {
 
 }
 
-new HTSPClient('127.0.0.1', 9982, (client) => {
-  client.getDiskSpace((x) => {
+new HTSPClient('192.168.1.5', 9982, (client) => {
+  client.hello((x) => {
     console.log(x);
-    //client.sock.end();
-
-    client.end();
+    //client.end();
+  });
+  client.videoHello((x) => {
+    console.log(x);
+    //client.end();
   });
 });

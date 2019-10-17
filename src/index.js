@@ -1,4 +1,5 @@
 const { app, BrowserWindow } = require('electron');
+const { HTSPClient } = require('./htsp');
 
 // Handle creating/removing shortcuts on Windows when installing/uninstalling.
 if (require('electron-squirrel-startup')) { // eslint-disable-line global-require
