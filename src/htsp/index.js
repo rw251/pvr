@@ -1,9 +1,33 @@
+const fs = require('fs');
 const net = require('net');
 const crypto = require('crypto');
 
 var HOST = 'media';
 var PORT = 9982;
 
+
+// MESSAGES FROM SERVER
+/*
+
+"{"method":"subscriptionGrace","subscriptionId":0,"graceTimeout":5}"
+
+"{"method":"subscriptionStatus","subscriptionId":0}"
+
+"{"method":"signalStatus","subscriptionId":0,"feStatus":"GOOD","feBER":0,"feUNC":0}"
+
+"{"method":"signalStatus","subscriptionId":0,"feStatus":"GOOD","feBER":0,"feUNC":0}"
+
+"{"meta":"...","streams":[{"index":1,"type":"MPEG2VIDEO","width":704,"height":576,"duration":40000,"aspect_num":16,"aspect_den":9},{"index":2,"type":"MPEG2AUDIO","language":"eng","audio_type":0,"audio_version":2,"channels":2,"rate":3},{"index":4,"type":"DVBSUB","language":"eng","composition_id":1,"ancillary_id":1}],"sourceinfo":{"adapter_uuid":"e5654b738c9affaed65fcb330e4d1f26","mux_uuid":"25de5e59f340374f20c848bc6ce499f3","network_uuid":"c639ab59f8c8c9e8511c06440908d5bd","adapter":"Sony CXD2880 #0 : DVB-T #0","mux":"706MHz","network":"DVB-T Network","network_type":"DVB-T","service":"BBC ONE N West"},"method":"subscriptionStart","subscriptionId":0}"
+
+"{"method":"queueStatus","subscriptionId":0,"packets":2,"bytes":768,"delay":0,"Bdrops":0,"Pdrops":0,"Idrops":0}"
+
+"{"method":"muxpkt","subscriptionId":0,"stream":2,"com":0,"pts":0,"dts":0,"duration":24000,"payload":"..."}"
+
+"{"method":"muxpkt","subscriptionId":0,"stream":2,"com":0,"pts":24000,"dts":24000,"duration":24000,"payload":"..."}"
+
+"{"method":"muxpkt","subscriptionId":0,"frametype":73,"stream":1,"com":0,"pts":1297144,"dts":1177144,"duration":40000,"payload":"..."}"
+
+*/
 
 
 const HMF_MAP = 1;
@@ -22,6 +46,12 @@ function chr(i) {
 function ord(c) {
   c = '' + c;
   return c.charCodeAt(0);
+}
+
+
+
+function bin2int(d) {
+	return (ord(d[0]) << 24) + (ord(d[1]) << 16)+ (ord(d[2]) <<  8) + ord(d[3]);
 }
 
 class hmf_bin {}
@@ -81,10 +111,6 @@ class HTSPMessage {
 
 	int2bin(i) {
 		return chr(i >> 24 & 0xFF) + chr(i >> 16 & 0xFF) + chr(i >> 8 & 0xFF) + chr(i & 0xFF);
-	}
-
-	bin2int(d) {
-		 return (ord(d[0]) << 24) + (ord(d[1]) << 16)+ (ord(d[2]) <<  8) + ord(d[3]);
 	}
 
 	binary_write(msg) {
@@ -155,7 +181,7 @@ class HTSPMessage {
 			var nlen = ord(data[1]);
 
 			//length of the data for name/key in nlen
-			var dlen = this.bin2int(data.slice(2,6));
+			var dlen = bin2int(data.slice(2,6));
 
 			data = data.slice(6);
 
@@ -199,7 +225,6 @@ class HTSPMessage {
 	}
 
 }
-
 class HTSPClient {
 	constructor(host, port, onConnect) {
 
@@ -245,7 +270,7 @@ class HTSPClient {
     })
     
 		this.videoSock.on('data', function(data) {
-      //var msg = new HTSPMessage().deserialize0(data.slice(4));
+			//var msg = new HTSPMessage().deserialize0(data.slice(4));
 			self.onVideoData(data);
 		});
 
@@ -275,51 +300,57 @@ class HTSPClient {
 		var s = new HTSPMessage().serialize(args);
 
     this[isVideo ? 'videoSock' : 'sock'].write(s, 'binary', callback);
-  } 
-  
+	}
 
-  short(func, args, callback, isVideo) {
-    args.htspversion = 27;
-    args.clientname = 'node-htsp';
-
-    this[isVideo ? 'onVideoData' : 'onData'] = function(data) {
-      data = data.slice(4);
-      var msg = new HTSPMessage().deserialize0(data);
-      callback(msg);
-    };
+	onServerVideoData(data) {
+		if(!this.resp) {				
+			this.bytesExpected = bin2int(data.slice(0,4));
+			this.resp = data.slice(4);
+		} else {
+			this.resp += data;
+		}
+		if(this.resp.length >= this.bytesExpected) {
+			const firstMessage = this.resp.slice(0, this.bytesExpected);
+			const msg = new HTSPMessage().deserialize0(firstMessage);
+			const secondMessage = this.resp.slice(this.bytesExpected);
+			this.resp = null;
+			if(secondMessage.length > 0) this.onServerVideoData(secondMessage);
+		}
+	}
   
-    this.send(func, args, null, isVideo);
-  }
-  
-  long(func, args, callback) {
+  long(func, args, callback, isVideo) {
     args.htspversion = 27;
     args.clientname = 'node-htsp';
 
     let resp;
-    let tout;
-    this.onData = function(data) {
-      clearTimeout(tout);
-      if(!resp) resp = data.slice(4);
-      else resp += data;
-      const msg = new HTSPMessage().deserialize0(resp);
-      tout = setTimeout(() => {
-        callback(msg)
-      }, 500);
+		let bytesExpected = 0;
+    this[isVideo ? 'onVideoData' : 'onData'] = function(data) {
+			if(!resp) {				
+				bytesExpected = bin2int(data.slice(0,4));
+				resp = data.slice(4);
+			} else {
+				resp += data;
+			}
+			if(resp.length === bytesExpected) {
+				const msg = new HTSPMessage().deserialize0(resp);
+				this.onVideoData = this.onServerVideoData;
+				callback(msg);
+			}
     };
   
-    this.send(func, args);
+    this.send(func, args, null, isVideo);
   }
 
 	hello(callback) {
-    this.short('hello', {}, callback);
+    this.long('hello', {}, callback);
   }
 
 	videoHello(callback) {
-    this.short('hello', {}, callback, true);
+    this.long('hello', {}, callback, true);
   }
   
   getDiskSpace(callback) {
-    this.short('getDiskSpace', {}, (msg) => {
+    this.long('getDiskSpace', {}, (msg) => {
       const {error, freediskspace = 0, totaldiskspace = 0} = new HTSPMessage().deserialize0(data);
       callback({freediskspace ,totaldiskspace});
     });
@@ -329,7 +360,7 @@ class HTSPClient {
    * @returns {Object} time - UNIX time / gmtoffset - minutes east of gmt
    */
   getSystemTime(callback) {
-    this.short('getSysTime', {}, (msg) => {
+    this.long('getSysTime', {}, (msg) => {
       const {error, time, gmtoffset} = new HTSPMessage().deserialize0(data);
       callback({time, gmtoffset});
     });
@@ -345,7 +376,7 @@ class HTSPClient {
    * @returns {Object} time - UNIX time / gmtoffset - minutes east of gmt
    */
   getChannel(channelId, callback) {
-    this.short('getChannel' , { channelId }, callback);
+    this.long('getChannel' , { channelId }, callback);
   }
 
   getEpgObject(id, callback) {
@@ -357,12 +388,12 @@ class HTSPClient {
   }
 
   getDvrConfigs(callback) {
-    this.short('getDvrConfigs', {}, callback);
+    this.long('getDvrConfigs', {}, callback);
   }
 
   subscribe(channelId, callback) {
     this.subId = Math.random();
-    this.long('subscribe', { channelId, subscriptionId: this.subId }, callback);
+    this.long('subscribe', { channelId, subscriptionId: this.subId }, callback, true);
   }
   
   end() {
@@ -372,12 +403,18 @@ class HTSPClient {
 }
 
 new HTSPClient('192.168.1.5', 9982, (client) => {
-  client.hello((x) => {
+	
+	client.subscribe(229602236,(x) => {
+		 //cbbc?
     console.log(x);
     //client.end();
-  });
-  client.videoHello((x) => {
-    console.log(x);
-    //client.end();
-  });
+	});
+  // client.subscribe(2093271676,(x) => {
+	//	 //cbbc?
+  //   console.log(x);
+  //   //client.end();
+	// });
+	// client.epgQuery('bbc news', (x) => {
+	// 	console.log(x);
+	// });
 });
